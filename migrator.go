@@ -1,11 +1,16 @@
 package migrator
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const defaultTableName = "migrations"
@@ -81,9 +86,13 @@ func New(opts ...Option) (*Migrator, error) {
 }
 
 // Migrate applies all available migrations
-func (m *Migrator) Migrate(db *sql.DB) error {
+func (m *Migrator) Migrate(ctx context.Context, db *sql.DB) error {
+	tracer := otel.Tracer("")
+
 	// create migrations table if doesn't exist
-	_, err := db.Exec(fmt.Sprintf(`
+	ctx, rootSpan := tracer.Start(ctx, "migrate")
+	defer rootSpan.End()
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id INT8 NOT NULL,
 			version VARCHAR(255) NOT NULL,
@@ -95,46 +104,61 @@ func (m *Migrator) Migrate(db *sql.DB) error {
 	}
 
 	// count applied migrations
-	count, err := countApplied(db, m.tableName)
+	count, err := countApplied(ctx, db, m.tableName)
 	if err != nil {
 		return err
 	}
+	rootSpan.SetAttributes(attribute.Int("applied", count))
 
 	if count > len(m.migrations) {
-		return errors.New("migrator: applied migration number on db cannot be greater than the defined migration list")
+		err := errors.New("migrator: applied migration number on db cannot be greater than the defined migration list")
+		rootSpan.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	// plan migrations
 	for idx, migration := range m.migrations[count:len(m.migrations)] {
 		insertVersion := fmt.Sprintf("INSERT INTO %s (id, version) VALUES (%d, '%s')", m.tableName, idx+count, migration.(fmt.Stringer).String())
+		ctx, span := tracer.Start(ctx, "migration")
+		defer span.End()
 		switch mig := migration.(type) {
 		case *Migration:
-			if err := migrate(db, m.logger, insertVersion, mig); err != nil {
+			span.SetAttributes(attribute.String("type", "tx"))
+			span.SetAttributes(attribute.String("name", mig.Name))
+			if err := migrate(ctx, db, m.logger, insertVersion, mig); err != nil {
+				span.SetStatus(codes.Error, err.Error())
 				return fmt.Errorf("migrator: error while running migrations: %v", err)
 			}
 		case *MigrationNoTx:
-			if err := migrateNoTx(db, m.logger, insertVersion, mig); err != nil {
+			span.SetAttributes(attribute.String("type", "no-tx"))
+			span.SetAttributes(attribute.String("name", mig.Name))
+			if err := migrateNoTx(ctx, db, m.logger, insertVersion, mig); err != nil {
+				span.SetStatus(codes.Error, err.Error())
 				return fmt.Errorf("migrator: error while running migrations: %v", err)
 			}
 		}
+		span.SetAttributes(attribute.Int("number", idx))
+		span.SetStatus(codes.Ok, "")
 	}
+
+	rootSpan.SetStatus(codes.Ok, "migrations applied successfully")
 
 	return nil
 }
 
 // Pending returns all pending (not yet applied) migrations
 func (m *Migrator) Pending(db *sql.DB) ([]interface{}, error) {
-	count, err := countApplied(db, m.tableName)
+	count, err := countApplied(context.Background(), db, m.tableName)
 	if err != nil {
 		return nil, err
 	}
 	return m.migrations[count:len(m.migrations)], nil
 }
 
-func countApplied(db *sql.DB, tableName string) (int, error) {
+func countApplied(ctx context.Context, db *sql.DB, tableName string) (int, error) {
 	// count applied migrations
 	var count int
-	rows, err := db.Query(fmt.Sprintf("SELECT count(*) FROM %s", tableName))
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tableName))
 	if err != nil {
 		return 0, err
 	}
@@ -173,8 +197,8 @@ func (m *MigrationNoTx) String() string {
 	return m.Name
 }
 
-func migrate(db *sql.DB, logger Logger, insertVersion string, migration *Migration) error {
-	tx, err := db.Begin()
+func migrate(ctx context.Context, db *sql.DB, logger Logger, insertVersion string, migration *Migration) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -191,7 +215,7 @@ func migrate(db *sql.DB, logger Logger, insertVersion string, migration *Migrati
 	if err = migration.Func(tx); err != nil {
 		return fmt.Errorf("error executing golang migration: %s", err)
 	}
-	if _, err = tx.Exec(insertVersion); err != nil {
+	if _, err = tx.ExecContext(ctx, insertVersion); err != nil {
 		return fmt.Errorf("error updating migration versions: %s", err)
 	}
 	logger.Printf("applied migration named '%s'", migration.Name)
@@ -199,12 +223,12 @@ func migrate(db *sql.DB, logger Logger, insertVersion string, migration *Migrati
 	return err
 }
 
-func migrateNoTx(db *sql.DB, logger Logger, insertVersion string, migration *MigrationNoTx) error {
+func migrateNoTx(ctx context.Context, db *sql.DB, logger Logger, insertVersion string, migration *MigrationNoTx) error {
 	logger.Printf("applying no tx migration named '%s'...", migration.Name)
 	if err := migration.Func(db); err != nil {
 		return fmt.Errorf("error executing golang migration: %s", err)
 	}
-	if _, err := db.Exec(insertVersion); err != nil {
+	if _, err := db.ExecContext(ctx, insertVersion); err != nil {
 		return fmt.Errorf("error updating migration versions: %s", err)
 	}
 	logger.Printf("applied no tx migration named '%s'", migration.Name)
